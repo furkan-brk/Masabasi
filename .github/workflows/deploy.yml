@@ -1,0 +1,149 @@
+name: Deploy Masabaşı
+# İlk kurulum ve VDS nginx/SSL adımları: docs/DEPLOY.md
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'app/**'
+      - 'backend/**'
+      - '.github/workflows/deploy-masabasi.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: deploy-masabasi
+  cancel-in-progress: true
+
+jobs:
+  # -------------------------------------------------------
+  # Backend -> VDS via SSH (docker compose)
+  # -------------------------------------------------------
+  deploy-backend:
+    name: Deploy Masabaşı Backend to VDS
+    runs-on: ubuntu-latest
+    timeout-minutes: 100
+    environment: masabasi-production
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Wait for CI success
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash .github/scripts/wait-for-ci.sh
+
+      - name: Deploy via SSH
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.VDS_HOST }}
+          username: ${{ secrets.VDS_USER }}
+          key: ${{ secrets.VDS_SSH_KEY }}
+          # 90m: kilit yüzünden diğer iki deploy'un cache'siz build'ini
+          # bekleyebilir (appleboy varsayılanı 10m — "Run Command Timeout").
+          command_timeout: 90m
+          script: |
+            set -euo pipefail
+
+            # appleboy/ssh-action non-interactive shell açar: /etc/profile ve
+            # /etc/profile.d/* OKUNMAZ, yani snap (/snap/bin) veya manuel
+            # kurulumların (/usr/local/bin) PATH'i gelmez. deploy.yml ile aynı
+            # desen — "docker: command not found" (exit 127) yaşandı (2026-07-30).
+            export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/snap/bin:$PATH"
+
+            if ! command -v docker >/dev/null 2>&1; then
+              echo "ERROR: 'docker' PATH'te bulunamadı. PATH=$PATH"
+              ls -l /usr/bin/docker /usr/local/bin/docker /snap/bin/docker 2>&1 || true
+              systemctl is-active docker 2>&1 || true
+              exit 1
+            fi
+
+            cd /opt/masabasi
+
+            # Bu repo ile Agent Tale deploy'u aynı VDS'i paylaşıyor —
+            # git ref yarışının ötesinde, paralel `docker build` de disk/CPU
+            # için yarışıp diski dolduruyordu ("no space left on device").
+            # Kilit artık git'ten healthcheck'e kadar TÜM script'i kapsıyor;
+            # deploy'lar tamamen sıralı çalışır (kilit dosyası Agent Tale ile ORTAK kalmalı).
+            exec 9>/tmp/agenttale-deploy.lock
+            flock -w 3600 9
+
+            git fetch origin main
+            git reset --hard origin/main
+
+            # Ensure .env.masabasi exists on the server. If not, copy from example.
+            if [ ! -f backend/.env.masabasi ]; then
+              cp backend/.env.masabasi.example backend/.env.masabasi
+              echo "WARNING: Created default .env.masabasi on server. Please configure it."
+            fi
+            mkdir -p app/build/web
+
+            # Disk hijyeni: deploy.yml ile aynı desen — bu servis prune
+            # etmediği için cache'i sınırsız büyüyüp diğer deploy'ların
+            # build'ini disk dolduğu için patlatıyordu.
+            docker image prune -f
+            docker builder prune -f --keep-storage 6GB
+
+            AVAIL_GB=$(df --output=avail -B1G /var/lib/docker | tail -1 | tr -d ' ')
+            if [ "$AVAIL_GB" -lt 5 ]; then
+              echo "ERROR: VDS disk kritik seviyede (${AVAIL_GB}GB boş). Build atlanıyor."
+              df -h /var/lib/docker
+              exit 1
+            fi
+
+            # Build and run the Masabaşı container stack using .env.masabasi file
+            docker compose --env-file backend/.env.masabasi -f backend/docker-compose.yml build
+            docker compose --env-file backend/.env.masabasi -f backend/docker-compose.yml up -d --remove-orphans
+
+            echo "Waiting for Masabaşı backend health on port 8090..."
+            for i in $(seq 1 12); do
+              if curl -sf http://localhost:8090/health >/dev/null; then
+                echo "Masabaşı backend deploy OK"
+                exit 0
+              fi
+              echo "Waiting for Masabaşı backend... attempt $i/12"
+              sleep 5
+            done
+            echo "ERROR: Masabaşı healthcheck failed after 60 seconds."
+            docker compose --env-file backend/.env.masabasi -f backend/docker-compose.yml logs --tail=50
+            exit 1
+
+  # -------------------------------------------------------
+  # Frontend -> VDS (Flutter Web build + SCP)
+  # -------------------------------------------------------
+  deploy-frontend:
+    name: Build Masabaşı Flutter Web & Deploy to VDS
+    runs-on: ubuntu-latest
+    needs: deploy-backend
+    timeout-minutes: 35
+    environment: masabasi-production
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: 'stable'
+          cache: true
+
+      - name: Install dependencies
+        working-directory: app
+        run: flutter pub get
+
+      - name: Build Flutter Web
+        working-directory: app
+        run: |
+          flutter build web --release \
+            --dart-define=API_BASE_URL=/api/v1
+
+      - name: Deploy to VDS via SCP
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.VDS_HOST }}
+          username: ${{ secrets.VDS_USER }}
+          key: ${{ secrets.VDS_SSH_KEY }}
+          source: app/build/web/*
+          target: /opt/masabasi/app/build/web/
+          strip_components: 3

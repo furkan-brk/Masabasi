@@ -1,0 +1,13 @@
+# secrets
+.env.masabasi
+secrets/
+
+# Flutter / Dart
+app/.dart_tool/
+app/build/
+app/.flutter-plugins
+app/.flutter-plugins-dependencies
+app/pubspec.lock
+
+# OS
+.DS_Store

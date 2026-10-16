@@ -1,0 +1,95 @@
+name: masabasi
+
+services:
+  masabasi-db:
+    image: postgres:16-alpine
+    container_name: masabasi_db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: masabasi
+      POSTGRES_PASSWORD: masabasi_dev_pw
+      POSTGRES_DB: masabasi
+    ports:
+      - "5434:5432"
+    volumes:
+      - masabasi_db_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U masabasi -d masabasi"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks:
+      - masabasi-net
+
+  masabasi-backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: masabasi_backend
+    restart: unless-stopped
+    depends_on:
+      masabasi-db:
+        condition: service_healthy
+      masabasi-minio:
+        condition: service_started
+    ports:
+      - "8090:8080"
+    volumes:
+      - "../secrets/gcp-key.json:/run/secrets/gcp_sa.json:ro"
+    environment:
+      PORT: "8080"
+      DB_URL: "postgres://masabasi:masabasi_dev_pw@masabasi-db:5432/masabasi?sslmode=disable"
+      JWT_SECRET: "${MASABASI_JWT_SECRET:-masabasi-change-me-in-prod}"
+      CORS_ORIGIN: "${MASABASI_CORS_ORIGIN:-*}"
+      SEED: "true"
+      CLAUDE_API_KEY: "${CLAUDE_API_KEY:-}"
+      GAMEMASTER_MODE: "${GAMEMASTER_MODE:-gemini}"
+      GCP_SERVICE_ACCOUNT_FILE: "${GCP_SERVICE_ACCOUNT_FILE:-/run/secrets/gcp_sa.json}"
+      GCP_PROJECT_ID: "${GCP_PROJECT_ID:-}"
+      GCP_REGION: "${GCP_REGION:-us-central1}"
+      GEMINI_MODEL: "${GEMINI_MODEL:-gemini-2.5-flash}"
+      MINIO_ENDPOINT: "masabasi-minio:9000"
+      MINIO_ACCESS_KEY: "masabasi_minio"
+      MINIO_SECRET_KEY: "masabasi_minio_dev_pw"
+      MINIO_BUCKET: "masabasi"
+      MINIO_PUBLIC_URL: "${MASABASI_PUBLIC_URL:-http://localhost:9000/masabasi}"
+    networks:
+      - masabasi-net
+
+  masabasi-minio:
+    image: minio/minio:latest
+    container_name: masabasi_minio
+    restart: unless-stopped
+    environment:
+      MINIO_ROOT_USER: masabasi_minio
+      MINIO_ROOT_PASSWORD: masabasi_minio_dev_pw
+    command: server /data --console-address ":9001"
+    volumes:
+      - masabasi_minio_data:/data
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    networks:
+      - masabasi-net
+
+  masabasi-frontend:
+    image: nginx:alpine
+    container_name: masabasi_frontend
+    restart: unless-stopped
+    depends_on:
+      - masabasi-backend
+    ports:
+      - "8091:80"
+    volumes:
+      - ../app/build/web:/usr/share/nginx/html:ro
+      - ../app/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+    networks:
+      - masabasi-net
+
+volumes:
+  masabasi_db_data:
+  masabasi_minio_data:
+
+networks:
+  masabasi-net:
+    driver: bridge
